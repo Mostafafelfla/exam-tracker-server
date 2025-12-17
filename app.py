@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request
 import json
 from datetime import datetime
 
@@ -20,8 +20,6 @@ def save_data(data):
 @app.route('/', methods=['GET', 'POST'])
 def track():
     data = request.args.to_dict()
-    if request.method == 'POST':
-        data.update(request.form.to_dict())
     data['received_at'] = datetime.now().isoformat()
     data['ip'] = request.remote_addr or 'unknown'
 
@@ -35,13 +33,14 @@ def track():
 @app.route('/view')
 def view():
     students = load_data()
-    html = "<h1 style='color:#22c55e; text-align:center;'>طلاب الامتحانات - Live View</h1>"
-    html += "<table border='1' style='width:100%; border-collapse:collapse;'><tr style='background:#22c55e;color:white;'><th>Device ID</th><th>Quiz</th><th>Slide</th><th>Answers</th><th>Last Update</th></tr>"
-    for id, info in students.items():
-        answers = str(info.get('answers', ''))[:150] + "..." if len(str(info.get('answers', ''))) > 150 else info.get('answers', '')
+    html = "<h1 style='color:#00ff88; text-align:center; font-family:Arial;'>طلاب الامتحانات - Live View</h1>"
+    html += "<table border='1' style='width:100%; border-collapse:collapse; margin:20px auto;'><tr style='background:#22c55e; color:white;'><th>Device ID</th><th>Quiz</th><th>Slide</th><th>Answers</th><th>Last Update</th></tr>"
+    for id, info in sorted(students.items(), key=lambda x: x[1]['received_at'], reverse=True):
+        answers = str(info.get('answers', ''))[:150].replace('<', '&lt;') + ("..." if len(str(info.get('answers', ''))) > 150 else "")
         html += f"<tr><td>{id}</td><td>{info.get('quiz', '')}</td><td>{info.get('slide', '')}</td><td>{answers}</td><td>{info.get('received_at', '')}</td></tr>"
     html += "</table>"
     html += "<meta http-equiv='refresh' content='30'>"
+    html += "<p style='text-align:center; color:#86efac;'>تحديث تلقائي كل 30 ثانية</p>"
     return html
 
 if __name__ == '__main__':
