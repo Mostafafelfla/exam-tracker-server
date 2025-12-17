@@ -5,7 +5,7 @@ import os
 
 app = Flask(__name__)
 
-DATA_FILE = 'students.json'
+DATA_FILE = '/tmp/students.json'
 
 def load_data():
     if not os.path.exists(DATA_FILE):
