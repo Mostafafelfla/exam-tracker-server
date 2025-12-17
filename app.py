@@ -1,17 +1,17 @@
 from flask import Flask, request, jsonify
 import json
 from datetime import datetime
-import os
 
 app = Flask(__name__)
 
-DATA_FILE = '/tmp/students.json'
+DATA_FILE = 'students.json'
 
 def load_data():
-    if not os.path.exists(DATA_FILE):
+    try:
+        with open(DATA_FILE, 'r') as f:
+            return json.load(f)
+    except:
         return {}
-    with open(DATA_FILE, 'r') as f:
-        return json.load(f)
 
 def save_data(data):
     with open(DATA_FILE, 'w') as f:
@@ -19,8 +19,8 @@ def save_data(data):
 
 @app.route('/', methods=['GET', 'POST'])
 def track():
-    data = request.form.to_dict() if request.method == 'POST' else request.args.to_dict()
-    data['received_at'] = datetime.utcnow().isoformat()
+    data = request.args.to_dict()
+    data['received_at'] = datetime.now().isoformat()
     data['ip'] = request.remote_addr
 
     students = load_data()
@@ -28,13 +28,17 @@ def track():
     students[device_id] = data
     save_data(students)
 
-    return jsonify({"status": "received", "device_id": device_id})
+    return "OK", 200
 
 @app.route('/view')
 def view():
     students = load_data()
-    html = "<h1>طلاب الامتحانات - Live</h1><table border='1'><tr><th>Device ID</th><th>Quiz</th><th>Slide</th><th>Answers</th><th>Last Update</th></tr>"
+    html = "<h1>طلاب الامتحانات - Live View</h1><table border='1'><tr><th>Device ID</th><th>Quiz</th><th>Slide</th><th>Answers</th><th>Last Update</th></tr>"
     for id, info in students.items():
-        html += f"<tr><td>{id}</td><td>{info.get('quiz', '')}</td><td>{info.get('slide', '')}</td><td>{info.get('answers', '')[:100]}</td><td>{info.get('received_at', '')}</td></tr>"
-    html += "</table>"
+        answers = info.get('answers', '[]')[:100] + "..." if len(info.get('answers', '')) > 100 else info.get('answers', '')
+        html += f"<tr><td>{id}</td><td>{info.get('quiz', '')}</td><td>{info.get('slide', '')}</td><td>{answers}</td><td>{info.get('received_at', '')}</td></tr>"
+    html += "</table><meta http-equiv='refresh' content='30'>"
     return html
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=10000)  # Render يستخدم port 10000 في Free
