@@ -20,8 +20,10 @@ def save_data(data):
 @app.route('/', methods=['GET', 'POST'])
 def track():
     data = request.args.to_dict()
+    if request.method == 'POST':
+        data.update(request.form.to_dict())
     data['received_at'] = datetime.now().isoformat()
-    data['ip'] = request.remote_addr
+    data['ip'] = request.remote_addr or 'unknown'
 
     students = load_data()
     device_id = data.get('device_id', 'unknown')
@@ -33,12 +35,14 @@ def track():
 @app.route('/view')
 def view():
     students = load_data()
-    html = "<h1>طلاب الامتحانات - Live View</h1><table border='1'><tr><th>Device ID</th><th>Quiz</th><th>Slide</th><th>Answers</th><th>Last Update</th></tr>"
+    html = "<h1 style='color:#22c55e; text-align:center;'>طلاب الامتحانات - Live View</h1>"
+    html += "<table border='1' style='width:100%; border-collapse:collapse;'><tr style='background:#22c55e;color:white;'><th>Device ID</th><th>Quiz</th><th>Slide</th><th>Answers</th><th>Last Update</th></tr>"
     for id, info in students.items():
-        answers = info.get('answers', '[]')[:100] + "..." if len(info.get('answers', '')) > 100 else info.get('answers', '')
+        answers = str(info.get('answers', ''))[:150] + "..." if len(str(info.get('answers', ''))) > 150 else info.get('answers', '')
         html += f"<tr><td>{id}</td><td>{info.get('quiz', '')}</td><td>{info.get('slide', '')}</td><td>{answers}</td><td>{info.get('received_at', '')}</td></tr>"
-    html += "</table><meta http-equiv='refresh' content='30'>"
+    html += "</table>"
+    html += "<meta http-equiv='refresh' content='30'>"
     return html
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)  # Render يستخدم port 10000 في Free
+    app.run(host='0.0.0.0', port=10000)  # Wasmer يستخدم port 10000
