@@ -10,12 +10,19 @@ DATA_FILE = '/tmp/students.json'
 def load_data():
     if not os.path.exists(DATA_FILE):
         return {}
-    with open(DATA_FILE, 'r') as f:
-        return json.load(f)
+    try:
+        with open(DATA_FILE, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print("LOAD ERROR:", e)
+        return {}
 
 def save_data(data):
-    with open(DATA_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+    try:
+        with open(DATA_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print("SAVE ERROR:", e)
 
 @app.route('/', methods=['GET', 'POST'])
 def track():
@@ -35,7 +42,7 @@ def view():
     students = load_data()
     html = "<h1 style='color:#22c55e; text-align:center;'>طلاب الامتحانات - Live View</h1>"
     html += "<table border='1' style='width:90%; margin:20px auto; border-collapse:collapse;'><tr style='background:#22c55e;color:white;'><th>Device ID</th><th>Quiz</th><th>Slide</th><th>Answers</th><th>Last Update</th></tr>"
-    for id, info in sorted(students.items(), key=lambda x: x[1]['received_at'], reverse=True):
+    for id, info in sorted(students.items(), key=lambda x: x[1].get('received_at',''), reverse=True):
         answers = str(info.get('answers', ''))[:150]
         html += f"<tr><td>{id}</td><td>{info.get('quiz', '')}</td><td>{info.get('slide', '')}</td><td>{answers}</td><td>{info.get('received_at', '')}</td></tr>"
     html += "</table>"
