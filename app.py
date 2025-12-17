@@ -1,18 +1,17 @@
 from flask import Flask, request, jsonify
 import json
 from datetime import datetime
+import os
 
 app = Flask(__name__)
 
-# ملف يحفظ البيانات
-DATA_FILE = 'students.json'
+DATA_FILE = '/tmp/students.json'
 
 def load_data():
-    try:
-        with open(DATA_FILE, 'r') as f:
-            return json.load(f)
-    except:
+    if not os.path.exists(DATA_FILE):
         return {}
+    with open(DATA_FILE, 'r') as f:
+        return json.load(f)
 
 def save_data(data):
     with open(DATA_FILE, 'w') as f:
@@ -20,10 +19,8 @@ def save_data(data):
 
 @app.route('/', methods=['GET', 'POST'])
 def track():
-    data = request.args.to_dict()
-    if request.method == 'POST':
-        data = request.form.to_dict()
-    data['received_at'] = datetime.now().isoformat()
+    data = request.form.to_dict() if request.method == 'POST' else request.args.to_dict()
+    data['received_at'] = datetime.utcnow().isoformat()
     data['ip'] = request.remote_addr
 
     students = load_data()
@@ -41,6 +38,3 @@ def view():
         html += f"<tr><td>{id}</td><td>{info.get('quiz', '')}</td><td>{info.get('slide', '')}</td><td>{info.get('answers', '')[:100]}</td><td>{info.get('received_at', '')}</td></tr>"
     html += "</table>"
     return html
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
