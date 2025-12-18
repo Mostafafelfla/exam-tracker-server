@@ -387,7 +387,7 @@ def api_upload():
 
                 if "screenshot" in json_data.get('type', ''):
                     url = f"/uploads/{filename}"
-                    socketio.emit('new_screenshot', {'device_id': device_id, 'url': url})
+                    socketio.emit('new_screenshot', {'device_id': device_id, 'url': f'/uploads/{filename}'})
                     logger.info(f"Screenshot from {device_id}")
                 else:
                     socketio.emit('new_file', {'device_id': device_id, 'filename': filename})
