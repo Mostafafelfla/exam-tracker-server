@@ -366,6 +366,21 @@ def api_generate_apk():
     return jsonify({"status": "success", "code": code})
 
 # ==========================================
+# (NEW) Endpoint لجلب قائمة الأجهزة لبرنامج البايثون
+# ==========================================
+@app.route('/api/devices_list', methods=['GET'])
+def api_devices_list():
+    """إرجاع قائمة الأجهزة بصيغة JSON"""
+    try:
+        devices = db.get_all_devices()
+        # تحويل الصفوف إلى قائمة من القواميس
+        d_list = [dict(d) for d in devices]
+        return jsonify(d_list)
+    except Exception as e:
+        logger.error(f"API List Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ==========================================
 # واجهة الويب (Control Panel UI)
 # ==========================================
 
